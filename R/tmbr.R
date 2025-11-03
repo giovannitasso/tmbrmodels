@@ -4,7 +4,6 @@
 #'
 #' @param formula A two-sided linear formula object describing the fixed-effects and
 #'   random-effects parts of the model. The structure is `response ~ fixed_effects + (random_effects | grouping_factor)`.
-#'   Only one grouping factor is currently supported.
 #' @param data A data frame containing the variables named in the formula.
 #' @param family Currently, only `family = "binomial"` is supported.
 #'
@@ -41,20 +40,12 @@
 #' # --- Fit the model using the new, simple formula interface! ---
 #' library(tmbrmodels)
 #' fit <- tmbr(
-#'   formula = y ~ x + (x | group), # Intercept and slope random effect
+#'   formula = y ~ x + (x | group),
 #'   data = sim_data,
 #'   family = "binomial"
 #' )
 #'
 #' print(fit)
-#' 
-#' # --- Fit a model with only random intercepts ---
-#' fit_intercept <- tmbr(
-#'   formula = y ~ x + (1 | group), # Only intercept random effect
-#'   data = sim_data,
-#'   family = "binomial"
-#' )
-#' print(fit_intercept)
 #' }
 tmbr <- function(formula, data, family = "binomial") {
 
@@ -79,35 +70,11 @@ tmbr <- function(formula, data, family = "binomial") {
   X <- lmod$X
   Z <- as(t(lmod$reTrms$Zt), "matrix")
   
-  # Extract group info and number of random effects per group
-  if (length(lmod$reTrms$flist) > 1) {
-      stop("Currently only one grouping factor is supported.")
-  }
+  # Extract the number of groups
   n_groups <- nlevels(lmod$reTrms$flist[[1]])
-  # n_reff_per_group is the number of columns in the model matrix for random effects per group
-  # which corresponds to the number of terms in the random effects formula part (e.g., (1|g)=1, (x|g)=2)
-  n_reff_per_group <- ncol(lmod$reTrms$Zt) / n_groups 
-  
-  # Get names for random effects from Zt column names if possible
-  re_names <- colnames(lmod$reTrms$Zt)
-  if (!is.null(re_names)) {
-      # Extract unique names (remove group prefix if present)
-      re_names <- unique(gsub(paste0(names(lmod$reTrms$flist)[1]), "", re_names, fixed = TRUE))
-      # Clean potential leading ':' or empty strings if intercept was implicit
-      re_names <- sub("^:", "", re_names)
-      if (any(re_names == "")) re_names[re_names == ""] <- "(Intercept)"
-  } else {
-      re_names <- NULL # Will use defaults later if names are missing
-  }
-
 
   # --- 3. Call the model fitting engine ---
-  fit <- fit_binomial_glmm(y = y, 
-                           X = X, 
-                           Z = Z, 
-                           n_groups = n_groups, 
-                           n_reff_per_group = n_reff_per_group,
-                           re_names = re_names) # Pass names down
+  fit <- fit_binomial_glmm(y = y, X = X, Z = Z, n_groups = n_groups)
 
   # --- 4. Return the result ---
   return(fit)
