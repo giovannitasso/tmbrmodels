@@ -6,6 +6,8 @@
 #' @param X A numeric matrix of fixed effects covariates. An intercept is recommended.
 #' @param Z A numeric matrix for the random effects design.
 #' @param n_groups The number of grouping levels for the random effects.
+#' @param n_reff_per_group The number of random effects per grouping level.
+#' @param re_names A character vector with names for the random effects (e.g., "(Intercept)", "x").
 #' @param initial_betas A numeric vector for the starting values of the fixed effects (betas).
 #'        If NULL, defaults to zeros.
 #'
@@ -15,7 +17,7 @@
 #' \dontrun{
 #' # This function is typically called internally by tmbr().
 #' }
-fit_binomial_glmm <- function(y, X, Z, n_groups, initial_betas = NULL) {
+fit_binomial_glmm <- function(y, X, Z, n_groups, n_reff_per_group, re_names = NULL, initial_betas = NULL) {
 
   # ---- 1. Data Validation and Preparation ----
   if (!is.numeric(y) || !all(y %in% c(0, 1))) {
@@ -35,7 +37,8 @@ fit_binomial_glmm <- function(y, X, Z, n_groups, initial_betas = NULL) {
     y = y, 
     X = X, 
     Z = Z,
-    n_groups = n_groups
+    n_groups = n_groups,
+    n_reff_per_group = n_reff_per_group # Pass this to C++
   )
   
   # ---- 2. Parameter Initialization ----
@@ -43,14 +46,14 @@ fit_binomial_glmm <- function(y, X, Z, n_groups, initial_betas = NULL) {
     initial_betas <- rep(0, ncol(X))
   }
   
-  # Assumes 2 random effects per group (intercept and slope) for initialization
-  n_reff_per_group = 2 
+  # Initialize Cholesky correlation parameters (vector of size k*(k-1)/2)
+  n_chol_params <- n_reff_per_group * (n_reff_per_group - 1) / 2
   
   tmb_params <- list(
     betas = initial_betas, 
     u = rep(0, ncol(Z)),
     log_stdevs = rep(0, n_reff_per_group),
-    transf_rho = 0 
+    L_corr = rep(0, n_chol_params) # Parameter vector for Cholesky factor
   )
   
   # ---- 3. TMB Model Fitting ----
@@ -58,6 +61,9 @@ fit_binomial_glmm <- function(y, X, Z, n_groups, initial_betas = NULL) {
     data = tmb_data, 
     parameters = tmb_params,
     random = "u",
+    map = list(), # Ensure map is empty unless needed later
+    # Need to map L_corr to fixed if only 1 random effect (no correlation)
+    map = if (n_reff_per_group <= 1) list(L_corr = factor(NA)) else list(),
     DLL = "tmbrmodels",
     silent = TRUE
   )
@@ -81,24 +87,52 @@ fit_binomial_glmm <- function(y, X, Z, n_groups, initial_betas = NULL) {
   
   # 2. Random Effects Variance Components
   stdev_idx <- which(rownames(summary_report) == "stdevs")
-  rho_idx <- which(rownames(summary_report) == "rho")
-  
   random_coeffs_stdevs <- summary_report[stdev_idx, , drop = FALSE]
-  random_coeffs_rho <- summary_report[rho_idx, , drop = FALSE]
   
-  # Assign explicit names assuming Intercept and 'x' slope
-  rownames(random_coeffs_stdevs) <- c("sigma_(Intercept)", "sigma_x") 
-  rownames(random_coeffs_rho) <- "corr_(Intercept)_x"
+  # Assign names to standard deviations
+  if (is.null(re_names) || length(re_names) != n_reff_per_group) {
+      if (n_reff_per_group == 1) re_names <- "(Intercept)"
+      else re_names <- paste0("reff_", 1:n_reff_per_group)
+      warning("Could not determine random effect names. Using defaults.")
+  }
+  rownames(random_coeffs_stdevs) <- paste0("sigma_", re_names)
   
-  random_coeffs <- rbind(random_coeffs_stdevs, random_coeffs_rho)
+  # Extract and format correlations if they exist (n_reff_per_group > 1)
+  if (n_reff_per_group > 1) {
+    corr_idx <- which(rownames(summary_report) == "R")
+    random_coeffs_corr_mat <- matrix(summary_report[corr_idx, "Estimate"], 
+                                     nrow = n_reff_per_group, ncol = n_reff_per_group)
+    random_coeffs_corr_se <- matrix(summary_report[corr_idx, "Std. Error"], 
+                                    nrow = n_reff_per_group, ncol = n_reff_per_group)
+    
+    # Extract only the lower triangle elements for the summary table
+    corr_estimates <- random_coeffs_corr_mat[lower.tri(random_coeffs_corr_mat)]
+    corr_ses <- random_coeffs_corr_se[lower.tri(random_coeffs_corr_se)]
+    
+    # Create names for correlations
+    corr_names <- character(0)
+    for (i in 2:n_reff_per_group) {
+      for (j in 1:(i-1)) {
+        corr_names <- c(corr_names, paste0("corr_", re_names[j], "_", re_names[i]))
+      }
+    }
+    
+    random_coeffs_corr <- data.frame(Estimate = corr_estimates, `Std. Error` = corr_ses)
+    rownames(random_coeffs_corr) <- corr_names
+    colnames(random_coeffs_corr) <- c("Estimate", "Std. Error") # Ensure correct colnames
+    
+    random_coeffs <- rbind(random_coeffs_stdevs, random_coeffs_corr)
+  } else {
+    random_coeffs <- random_coeffs_stdevs # Only stdev if 1 random effect
+  }
 
   # 3. Combine and Format
   final_summary <- rbind(fixed_coeffs, random_coeffs)
-  colnames(final_summary) <- c("Estimate", "Std. Error")
+  colnames(final_summary) <- c("Estimate", "Std. Error") # Ensure correct colnames again
   
   final_summary <- as.data.frame(final_summary)
   
-  # Calculate z-values and p-values (note interpretation diff for variance components)
+  # Calculate z-values and p-values
   final_summary$"z value" <- final_summary[, "Estimate"] / final_summary[, "Std. Error"]
   final_summary$"Pr(>|z|)" <- 2 * stats::pnorm(-abs(final_summary$"z value"))
   
