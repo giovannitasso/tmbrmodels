@@ -1,116 +1,90 @@
+// Keep includes minimal: TMB.hpp should handle dependencies.
 #include <TMB.hpp>
+#include <TMB.hpp> // Only include TMB
 
-// Define M_PI (pi) if not already defined
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+// Use the density namespace for MVNORM
+using namespace density;
 
 template<class Type>
 Type objective_function<Type>::operator() () {
-  
-//==========================
-// DATA SECTION
-//==========================
-  DATA_VECTOR(y);             // Response vector (0/1)
-  DATA_MATRIX(X);             // Fixed effects design matrix
-  DATA_MATRIX(Z);             // Random effects design matrix
-  DATA_INTEGER(n_groups);         // Number of groups (e.g., subjects, sites)
-  DATA_INTEGER(n_reff_per_group); // Number of random effects per group (e.g., 2 for intercept + slope)
+@@ -19,25 +21,46 @@ Type objective_function<Type>::operator() () {
+  PARAMETER_VECTOR(betas);  // fixed effects
+  PARAMETER_VECTOR(u);      // random effects
 
-  
-//==========================
-// PARAMETER SECTION
-//==========================
-  PARAMETER_VECTOR(betas);        // Fixed effects coefficients
-  PARAMETER_VECTOR(u);            // Random effects vector (all groups combined)
-  PARAMETER_VECTOR(log_stdevs);   // Vector of log-standard deviations for random effects
-  PARAMETER_CHOLESKY_CORR(L_corr); // Cholesky factor of the correlation matrix
+  // Parameters for unstructured covariance matrix
+  // Parameters for manual covariance construction
+  // Assumes 2 random effects per group (intercept and slope)
+  PARAMETER_VECTOR(log_stdevs);   // log(stdev) vector [log(sigma_int), log(sigma_slope)]
+  PARAMETER(transf_corr);      // Transformed correlation parameter (-inf, +inf)
+
+  PARAMETER_VECTOR(log_stdevs); // log(stdev) vector [log(sigma_int), log(sigma_slope)]
+  PARAMETER(transf_rho);      // Transformed correlation parameter (-inf, +inf), we'll use tanh
 
 //==========================
 // PRELIMINARY CALCULATIONS
 //==========================
-  
-  // --- Manual Covariance Construction ---
-  
-  // 1. Standard deviations
-  vector<Type> stdevs = exp(log_stdevs);
-  
-  // 2. Diagonal matrix S of standard deviations
-  matrix<Type> S = matrix<Type>(n_reff_per_group, n_reff_per_group).setZero();
-  for(int i = 0; i < n_reff_per_group; ++i) {
-      S(i,i) = stdevs(i);
-  }
-  
-  // 3. Cholesky factor (L_cov) of the covariance matrix
-  // Sigma = S * R * S^T = (S * L_corr) * (S * L_corr)^T
-  // L_cov = S * L_corr
-  matrix<Type> L_cov = S * L_corr;
 
-  // 4. log-determinant of L_cov
-  // log(det(L_cov)) = sum(log(diag(L_cov)))
-  Type logdet_L_cov = 0.0;
-  for (int i=0; i < n_reff_per_group; i++) {
-      logdet_L_cov += log(L_cov(i,i));
-  }
-  
-  // 5. Constant for the NLL
-  Type log_2pi = log(2.0 * M_PI);
+  // Setup for MVN density using TMB's built-in tools
+  int n_reff_per_group = 2; // Hardcoded for intercept and slope for now
+  density::UNSTRUCTURED_CORR_t<Type> nldens = density::UNSTRUCTURED_CORR_t<Type>(log_stdevs, transf_corr);
+  // --- Manual Covariance Matrix Construction ---
+  int n_reff_per_group = 2; // Hardcoded for intercept and slope
 
-  // --- Linear Predictor and Probability ---
+  // Linear predictor (using TMB/Eigen matrix operations)
   vector<Type> eta = X * betas + Z * u;
+  // 1. Calculate standard deviations and correlation
+  vector<Type> stdevs = exp(log_stdevs);
+  Type rho = tanh(transf_rho); // rho is between -1 and 1
+  
+  // 2. Construct the Cholesky factor (L_corr) of the correlation matrix R = [[1, rho], [rho, 1]]
+  matrix<Type> L_corr(n_reff_per_group, n_reff_per_group);
+  L_corr(0,0) = 1.0;
+  L_corr(0,1) = 0.0;
+  L_corr(1,0) = rho;
+  L_corr(1,1) = sqrt(1.0 - rho*rho);
+  
+  // 3. Construct the diagonal matrix S of standard deviations
+  matrix<Type> S = matrix<Type>(n_reff_per_group, n_reff_per_group).setZero();
+  S(0,0) = stdevs(0);
+  S(1,1) = stdevs(1);
+
+  // Apply the inverse-logit link function to get probabilities
   // Explicit cast to vector<Type> to avoid Eigen lazy-evaluation issues
+  // 4. Construct the Cholesky factor (L_cov) of the covariance matrix Sigma = S * R * S^T = (S * L_corr) * (S * L_corr)^T
+  matrix<Type> L_cov = S * L_corr;
+  
+  // 5. Create the MVN density object using the Cholesky factor L_cov
+  MVNORM_t<Type> neg_log_dmvnorm(L_cov);
+  // Alternative using full Sigma matrix (less efficient but maybe more stable?):
+  // matrix<Type> Sigma = L_cov * L_cov.transpose();
+  // MVNORM_t<Type> neg_log_dmvnorm(Sigma); 
+  
+  // --- Linear predictor and probability ---
+  vector<Type> eta = X * betas + Z * u;
+  // Explicit cast to avoid lazy evaluation issues
   vector<Type> p = vector<Type>(1.0 / (1.0 + exp(-eta))); 
 
 //==========================
-// LIKELIHOOD SECTION
-//==========================
-  Type nll = 0.0; // NLL = Negative Log-Likelihood
-
-  // --- Manual Prior for Random Effects ---
-  // NLL = -log(L(u | Sigma))
-  // NLL = k/2 * log(2pi) + log(det(L_cov)) + 0.5 * ||v||^2
-  // where v = L_cov^{-1} * u
-  
-  vector<Type> u_group_i(n_reff_per_group); // Reusable vector for this group's effects
-  vector<Type> v(n_reff_per_group);         // Reusable vector for transformed effects
-  
-  for(int i = 0; i < n_groups; ++i){
-      // Reconstruct the u-vector for this group
-      // Assumes u is ordered [eff1_g1..N, eff2_g1..N, ..., effk_g1..N]
-      for(int j = 0; j < n_reff_per_group; ++j){
-          u_group_i(j) = u(j * n_groups + i); 
-      }
-      
-      // Solve L_cov * v = u_group_i for v
-      // Use TMB's atomic solver for numerical stability
-      v = atomic::solve(L_cov, u_group_i);
-      
-      // Add NLL components
-      nll += n_reff_per_group * 0.5 * log_2pi; // k/2 * log(2pi)
-      nll += logdet_L_cov;                      // log(det(L_cov))
-      nll += 0.5 * v.squaredNorm();             // 0.5 * ||v||^2
+@@ -52,11 +75,11 @@ Type objective_function<Type>::operator() () {
+    vector<Type> u_group_i(n_reff_per_group);
+    u_group_i(0) = u(i);              // Intercept for group i
+    u_group_i(1) = u(i + n_groups);   // Slope for group i
+    nll += nldens(u_group_i); // Adds the *negative* log-density from the MVN prior
+    // Use the MVN density object created above
+    nll += neg_log_dmvnorm(u_group_i); // Adds the *negative* log-density
   }
-  
-  // --- Likelihood for the Response ---
+
+  // Likelihood for the response: y_i ~ Binomial(1, p_i)
+  // Use TMB's vectorized dbinom, subtracting log-prob because it's NLL
   nll -= sum(dbinom(y, Type(1.0), p, true));
 
 //============================   
-//     REPORT section
-//============================
-  REPORT(betas);
-  REPORT(p);       
-  REPORT(eta);
+@@ -68,9 +91,6 @@ Type objective_function<Type>::operator() () {
   REPORT(u);
-  
-  // Report variance components
-  matrix<Type> R = L_corr * L_corr.transpose();
+
+  // Report the standard deviations and correlation derived from parameters
+  vector<Type> stdevs = exp(log_stdevs);
+  Type rho = nldens.corr(0, 1); // Extract correlation between effect 1 and 2
   
   REPORT(stdevs);
-  REPORT(R); // Report the full correlation matrix
-  
-  // ADREPORT for standard errors
-  ADREPORT(stdevs);
-  ADREPORT(R);
-
-  return nll;
-}
+  REPORT(rho);
