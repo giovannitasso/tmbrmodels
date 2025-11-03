@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="man/figures/tmbrmodelslogo.png" height="160" />
+  <img src="man/figures/logo_tmbr.png" height="160" />
 </p>
 
 # tmbrmodels
@@ -122,8 +122,6 @@ The main `tmbr()` function uses the `family` argument to select the model:
     * **Model:** Generalized Linear Mixed Model (GLMM) for binary (0/1) outcomes.
     * **Link Function:** `logit`
     * **Random Effects:** Supports full covariance structures for intercepts and slopes (e.g., `(x | group)`).
-
-*(Esta sección se expandirá a medida que se agreguen más familias, como Poisson).*
 
 
 ## Contributing
